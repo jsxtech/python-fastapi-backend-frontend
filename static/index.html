@@ -1,6 +1,8 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FastAPI Frontend</title>
     <style>
         body { font-family: Arial; max-width: 1000px; margin: 20px auto; }
@@ -49,7 +51,7 @@
         <div style="display: flex; justify-content: space-between; align-items: center;">
             <h1>FastAPI Inventory Manager</h1>
             <div>
-                <span id="username" style="margin-right: 10px;"></span>
+                <span id="usernameDisplay" style="margin-right: 10px;"></span>
                 <button onclick="logout()">Logout</button>
             </div>
         </div>
@@ -58,8 +60,8 @@
     
     <h2>Add/Edit Item</h2>
     <input id="name" placeholder="Name">
-    <input id="price" type="number" placeholder="Price" step="0.01">
-    <input id="quantity" type="number" placeholder="Quantity" value="0">
+    <input id="price" type="number" placeholder="Price" step="0.01" min="0">
+    <input id="quantity" type="number" placeholder="Quantity" value="0" min="0">
     <textarea id="description" placeholder="Description"></textarea>
     <input id="category" placeholder="Category">
     <input id="tags" placeholder="Tags (comma separated)">
@@ -137,7 +139,12 @@
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({username, password})
             })
-            .then(res => res.json())
+            .then(res => {
+                if (!res.ok) {
+                    throw new Error('Login failed');
+                }
+                return res.json();
+            })
             .then(data => {
                 token = data.token;
                 localStorage.setItem('token', token);
@@ -160,8 +167,15 @@
             if (ws) ws.close();
         }
 
+        function escapeHtml(str) {
+            if (!str) return '';
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
         function initApp() {
-            document.getElementById('username').textContent = localStorage.getItem('username') || 'User';
+            document.getElementById('usernameDisplay').textContent = localStorage.getItem('username') || 'User';
             fetchItems();
             loadStats();
             loadCategories();
@@ -169,12 +183,22 @@
         }
 
         function connectWebSocket() {
-            ws = new WebSocket(`ws://${location.host}/ws`);
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}/ws`);
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
                 showNotification(data.message);
                 fetchItems();
                 loadStats();
+            };
+            ws.onclose = () => {
+                // Reconnect after 3 seconds if not a manual logout
+                if (token) {
+                    setTimeout(connectWebSocket, 3000);
+                }
+            };
+            ws.onerror = () => {
+                ws.close();
             };
         }
 
@@ -193,6 +217,17 @@
             };
         }
 
+        async function authFetch(url, options = {}) {
+            const res = await fetch(url, options);
+            if (res.status === 401 || res.status === 403) {
+                // Token expired or invalid - force re-login
+                logout();
+                showNotification('Session expired. Please log in again.');
+                throw new Error('Unauthorized');
+            }
+            return res;
+        }
+
         if (localStorage.getItem('token')) {
             token = localStorage.getItem('token');
             document.getElementById('loginSection').classList.add('hidden');
@@ -203,7 +238,7 @@
         initTheme();
 
         async function saveItem() {
-            const name = document.getElementById('name').value;
+            const name = document.getElementById('name').value.trim();
             const price = parseFloat(document.getElementById('price').value);
             const quantity = parseInt(document.getElementById('quantity').value) || 0;
             const description = document.getElementById('description').value;
@@ -211,25 +246,32 @@
             const tags = document.getElementById('tags').value.split(',').map(t => t.trim()).filter(t => t);
             const in_stock = document.getElementById('in_stock').checked;
             
-            if (!name || !price) {
-                document.getElementById('error').textContent = 'Name and price required';
+            if (!name || isNaN(price) || price < 0) {
+                document.getElementById('error').textContent = 'Name required and price must be a non-negative number';
                 return;
             }
 
             try {
                 const method = editingId ? 'PUT' : 'POST';
                 const url = editingId ? `/api/items/${editingId}` : '/api/items';
-                await fetch(url, {
+                const res = await authFetch(url, {
                     method,
                     headers: getHeaders(),
                     body: JSON.stringify({name, price, quantity, description, category, tags, in_stock})
                 });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => null);
+                    document.getElementById('error').textContent = err?.detail || `Error: ${res.status}`;
+                    return;
+                }
                 clearForm();
                 fetchItems();
                 loadStats();
                 loadCategories();
             } catch (e) {
-                document.getElementById('error').textContent = 'Error saving item';
+                if (e.message !== 'Unauthorized') {
+                    document.getElementById('error').textContent = 'Network error saving item';
+                }
             }
         }
 
@@ -285,7 +327,7 @@
                 alert('No items selected');
                 return;
             }
-            await fetch('/api/bulk-update', {
+            await authFetch('/api/bulk-update', {
                 method: 'POST',
                 headers: getHeaders(),
                 body: JSON.stringify({
@@ -298,7 +340,7 @@
         }
 
         async function duplicateItem(id) {
-            await fetch(`/api/duplicate/${id}`, {method: 'POST', headers: getHeaders()});
+            await authFetch(`/api/duplicate/${id}`, {method: 'POST', headers: getHeaders()});
             fetchItems();
             loadStats();
         }
@@ -316,7 +358,7 @@
                 <div class="chart">
                     <h3>Price Distribution</h3>
                     ${Object.entries(data.price_distribution).map(([range, count]) => 
-                        `<div><strong>$${range}:</strong> ${count} items
+                        `<div><strong>$${escapeHtml(range)}:</strong> ${count} items
                         <div class="bar" style="width: ${count * 20}px"></div></div>`
                     ).join('')}
                 </div>
@@ -328,7 +370,7 @@
                 <div class="chart">
                     <h3>Recent Activity</h3>
                     ${data.recent_activity.map(a => 
-                        `<div class="activity-item">${a.action} - ${a.item} (${new Date(a.timestamp).toLocaleString()})</div>`
+                        `<div class="activity-item">${escapeHtml(a.action)} - ${escapeHtml(a.item)} (${new Date(a.timestamp).toLocaleString()})</div>`
                     ).join('')}
                 </div>
             `;
@@ -342,7 +384,7 @@
             document.getElementById('modalTitle').textContent = 'Activity Log';
             document.getElementById('modalBody').innerHTML = data.map(a => 
                 `<div class="activity-item">
-                    <strong>${a.action}</strong> - ${a.item}<br>
+                    <strong>${escapeHtml(a.action)}</strong> - ${escapeHtml(a.item)}<br>
                     <small>${new Date(a.timestamp).toLocaleString()}</small>
                 </div>`
             ).join('');
@@ -365,7 +407,7 @@
                 <div class="chart">
                     <h3>Top Categories by Value</h3>
                     ${Object.entries(data.top_categories).map(([cat, info]) => 
-                        `<div><strong>${cat}:</strong> ${info.count} items, $${info.value.toFixed(2)}
+                        `<div><strong>${escapeHtml(cat)}:</strong> ${info.count} items, $${info.value.toFixed(2)}
                         <div class="bar" style="width: ${info.value / 10}px; background: #ff9800;"></div></div>`
                     ).join('')}
                 </div>
@@ -385,6 +427,7 @@
             a.href = url;
             a.download = 'inventory.pdf';
             a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
         }
 
         function toggleDarkMode() {
@@ -399,7 +442,7 @@
         }
 
         async function scheduleBackup() {
-            await fetch('/api/backup/schedule', {method: 'POST', headers: getHeaders()});
+            await authFetch('/api/backup/schedule', {method: 'POST', headers: getHeaders()});
             showNotification('Backup scheduled');
         }
 
@@ -416,7 +459,7 @@
 
         async function deleteItem(id) {
             if (confirm('Delete this item?')) {
-                await fetch(`/api/items/${id}`, {method: 'DELETE'});
+                await authFetch(`/api/items/${id}`, {method: 'DELETE', headers: getHeaders()});
                 fetchItems();
                 loadStats();
             }
@@ -430,13 +473,13 @@
             const maxQty = document.getElementById('maxQty').value;
             const tags = document.getElementById('tagFilter').value;
             
-            let url = '/api/search/advanced?';
-            if (search) url += `q=${search}&`;
-            if (minQty) url += `min_qty=${minQty}&`;
-            if (maxQty) url += `max_qty=${maxQty}&`;
-            if (tags) url += `tags=${tags}&`;
+            const params = new URLSearchParams();
+            if (search) params.set('q', search);
+            if (minQty) params.set('min_qty', minQty);
+            if (maxQty) params.set('max_qty', maxQty);
+            if (tags) params.set('tags', tags);
             
-            let res = await fetch(url);
+            let res = await fetch(`/api/search/advanced?${params.toString()}`);
             let data = await res.json();
             
             if (category) data = data.filter(i => i.category === category);
@@ -472,15 +515,18 @@
             const cats = await res.json();
             const select = document.getElementById('categoryFilter');
             select.innerHTML = '<option value="">All Categories</option>' + 
-                cats.map(c => `<option value="${c}">${c}</option>`).join('');
+                cats.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
         }
 
+        let currentItems = [];
+
         function renderItems(data) {
+            currentItems = data;
             if (data.length === 0) {
                 document.getElementById('items').innerHTML = '<p style="text-align: center; color: #999; padding: 40px;">No items found. Add your first item above!</p>';
                 return;
             }
-            document.getElementById('items').innerHTML = data.map(item => {
+            document.getElementById('items').innerHTML = data.map((item, idx) => {
                 const qty = item.quantity || 0;
                 const lowStock = qty < 5 && qty > 0;
                 const checked = selectedItems.has(item.id) ? 'checked' : '';
@@ -488,14 +534,14 @@
                     <div style="display: flex; justify-content: space-between; align-items: start;">
                         ${bulkMode ? `<input type="checkbox" ${checked} onchange="toggleSelect(${item.id})">` : ''}
                         <div style="flex: 1;">
-                            <strong style="font-size: 1.2em;">${item.name}</strong> - $${item.price} 
-                            <span style="color: #666">[${item.category || 'General'}]</span>
+                            <strong style="font-size: 1.2em;">${escapeHtml(item.name)}</strong> - $${item.price.toFixed(2)} 
+                            <span style="color: #666">[${escapeHtml(item.category || 'General')}]</span>
                             <div style="margin: 5px 0;">Quantity: <strong>${qty}</strong> ${lowStock ? '⚠️ Low Stock' : ''} ${!item.in_stock ? '❌ Out of Stock' : '✅'}</div>
-                            ${item.tags && item.tags.length ? '<div>' + item.tags.map(t => `<span class="tag">${t}</span>`).join('') + '</div>' : ''}
-                            ${item.description ? `<p style="color: #666;">${item.description}</p>` : ''}
+                            ${item.tags && item.tags.length ? '<div>' + item.tags.map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('') + '</div>' : ''}
+                            ${item.description ? `<p style="color: #666;">${escapeHtml(item.description)}</p>` : ''}
                         </div>
                         <div>
-                            <button onclick='editItem(${JSON.stringify(item)})'>Edit</button>
+                            <button onclick="editItem(currentItems[${idx}])">Edit</button>
                             <button onclick="duplicateItem(${item.id})" style="background: #ff9800;">Duplicate</button>
                             <button onclick="deleteItem(${item.id})" style="background: #f44336;">Delete</button>
                         </div>
@@ -505,7 +551,7 @@
         }
 
         async function exportData() {
-            const res = await fetch('/api/export', {method: 'POST'});
+            const res = await fetch('/api/export');
             const data = await res.json();
             const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
             const url = URL.createObjectURL(blob);
@@ -513,13 +559,18 @@
             a.href = url;
             a.download = 'items.json';
             a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
         }
 
         async function importData() {
             const file = document.getElementById('importFile').files[0];
             const formData = new FormData();
             formData.append('file', file);
-            await fetch('/api/import', {method: 'POST', body: formData});
+            await authFetch('/api/import', {
+                method: 'POST',
+                headers: {'Authorization': `Bearer ${token}`},
+                body: formData
+            });
             fetchItems();
             loadStats();
             loadCategories();
