@@ -105,6 +105,58 @@ MAX_ACTIVITY_LOG = 1000
 
 DB_FILE = "items.json"
 
+def normalize_item(raw: dict, fallback_id: int) -> Optional[dict]:
+    """Coerce a raw dict into a well-formed item, or return None if unusable.
+
+    Guarantees every returned item has all fields the API relies on, so that
+    downstream endpoints can index item["price"]/item["name"] without KeyError.
+    """
+    if not isinstance(raw, dict):
+        return None
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    # price: accept int/float (but not bool), coerce numeric strings, reject the rest
+    price = raw.get("price")
+    if isinstance(price, bool):
+        return None
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if price < 0:
+        return None
+    quantity = raw.get("quantity", 0)
+    if isinstance(quantity, bool):
+        quantity = 0
+    try:
+        quantity = int(quantity)
+    except (TypeError, ValueError):
+        quantity = 0
+    if quantity < 0:
+        quantity = 0
+    raw_tags = raw.get("tags", [])
+    tags = [t for t in raw_tags if isinstance(t, str)] if isinstance(raw_tags, list) else []
+    item_id = raw.get("id", fallback_id)
+    if isinstance(item_id, bool) or not isinstance(item_id, int):
+        item_id = fallback_id
+    description = raw.get("description")
+    if description is not None and not isinstance(description, str):
+        description = str(description)
+    category = raw.get("category", "General")
+    if not isinstance(category, str):
+        category = "General"
+    return {
+        "id": item_id,
+        "name": name.strip(),
+        "price": price,
+        "description": description,
+        "category": category,
+        "in_stock": bool(raw.get("in_stock", True)),
+        "quantity": quantity,
+        "tags": tags,
+    }
+
 def load_db():
     global items_db, next_id
     if Path(DB_FILE).exists():
@@ -113,23 +165,39 @@ def load_db():
                 fcntl.flock(f, fcntl.LOCK_SH)
                 try:
                     data = json.load(f)
-                    items_db = data.get("items", [])
-                    next_id = data.get("next_id", 1)
+                    raw_items = data.get("items", [])
+                    stored_next_id = data.get("next_id", 1)
                 finally:
                     fcntl.flock(f, fcntl.LOCK_UN)
-        except (json.JSONDecodeError, ValueError, KeyError):
-            # Corrupted file - start with empty database
+        except (json.JSONDecodeError, ValueError, KeyError, OSError):
+            # Corrupted/unreadable file - start with empty database
             items_db = []
             next_id = 1
+            return
+        # Drop any malformed entries so endpoints never hit a KeyError later
+        cleaned = []
+        for raw in raw_items if isinstance(raw_items, list) else []:
+            normalized = normalize_item(raw, fallback_id=len(cleaned) + 1)
+            if normalized is not None:
+                cleaned.append(normalized)
+        items_db = cleaned
+        max_id = max((i["id"] for i in items_db), default=0)
+        if not isinstance(stored_next_id, int) or isinstance(stored_next_id, bool):
+            stored_next_id = max_id + 1
+        next_id = max(stored_next_id, max_id + 1)
+
+def _save_db_unlocked():
+    """Persist state to disk. Caller must already hold db_lock."""
+    with open(DB_FILE, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            json.dump({"items": items_db, "next_id": next_id}, f)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 def save_db():
     with db_lock:
-        with open(DB_FILE, "w") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                json.dump({"items": items_db, "next_id": next_id}, f)
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+        _save_db_unlocked()
 
 load_db()
 
@@ -175,15 +243,15 @@ async def websocket_endpoint(websocket: WebSocket):
 def get_items(search: Optional[str] = None, category: Optional[str] = None, sort: Optional[str] = None):
     result = items_db
     if search:
-        result = [i for i in result if search.lower() in i["name"].lower() or search.lower() in (i.get("description") or "").lower()]
+        result = [i for i in result if search.lower() in i.get("name", "").lower() or search.lower() in (i.get("description") or "").lower()]
     if category:
         result = [i for i in result if i.get("category") == category]
     if sort == "price_asc":
-        result = sorted(result, key=lambda x: x["price"])
+        result = sorted(result, key=lambda x: x.get("price", 0))
     elif sort == "price_desc":
-        result = sorted(result, key=lambda x: x["price"], reverse=True)
+        result = sorted(result, key=lambda x: x.get("price", 0), reverse=True)
     elif sort == "name":
-        result = sorted(result, key=lambda x: x["name"])
+        result = sorted(result, key=lambda x: x.get("name", ""))
     return result
 
 @app.get("/api/categories")
@@ -199,18 +267,18 @@ def get_stats():
     return {
         "total": len(items_db),
         "in_stock": sum(1 for i in items_db if i.get("in_stock", True)),
-        "total_value": round(sum(i["price"] * i.get("quantity", 0) for i in items_db), 2),
+        "total_value": round(sum(i.get("price", 0) * i.get("quantity", 0) for i in items_db), 2),
         "low_stock": len(low_stock),
         "categories": len(set(i.get("category", "General") for i in items_db)),
         "by_category": dict(by_category),
-        "avg_price": round(sum(i["price"] for i in items_db) / len(items_db), 2) if items_db else 0
+        "avg_price": round(sum(i.get("price", 0) for i in items_db) / len(items_db), 2) if items_db else 0
     }
 
 @app.get("/api/analytics")
 def get_analytics():
     price_ranges = {"0-10": 0, "10-50": 0, "50-100": 0, "100+": 0}
     for item in items_db:
-        p = item["price"]
+        p = item.get("price", 0)
         if p < 10: price_ranges["0-10"] += 1
         elif p < 50: price_ranges["10-50"] += 1
         elif p < 100: price_ranges["50-100"] += 1
@@ -267,7 +335,7 @@ def export_pdf():
     
     y = 720
     for item in items_db[:30]:  # Limit to 30 items
-        text = f"{item['name']} - ${item['price']} - Qty: {item.get('quantity', 0)}"
+        text = f"{item.get('name', '')} - ${item.get('price', 0)} - Qty: {item.get('quantity', 0)}"
         p.drawString(50, y, text)
         y -= 20
         if y < 50:
@@ -300,12 +368,18 @@ async def schedule_backup(background_tasks: BackgroundTasks, user: str = Depends
 async def bulk_update(req: BulkUpdateRequest, user: str = Depends(verify_token)):
     count = 0
     updated_names = []
-    for item in items_db:
-        if item["id"] in req.item_ids:
-            item.update(req.updates)
-            updated_names.append(item["name"])
-            count += 1
-    save_db()
+    updates = dict(req.updates)
+    # Keep name normalization consistent with the Item validator
+    if "name" in updates and isinstance(updates["name"], str):
+        updates["name"] = updates["name"].strip()
+    id_set = set(req.item_ids)
+    with db_lock:
+        for item in items_db:
+            if item["id"] in id_set:
+                item.update(updates)
+                updated_names.append(item["name"])
+                count += 1
+        _save_db_unlocked()
     log_activity("bulk_updated", f"{count} items: {', '.join(updated_names[:5])}")
     await broadcast({"message": f"{count} items bulk updated by {user}"})
     return {"updated": count}
@@ -313,13 +387,14 @@ async def bulk_update(req: BulkUpdateRequest, user: str = Depends(verify_token))
 @app.post("/api/duplicate/{item_id}")
 async def duplicate_item(item_id: int, user: str = Depends(verify_token)):
     global next_id
-    item = next((i for i in items_db if i["id"] == item_id), None)
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-    new_item = {**item, "id": next_id, "name": f"{item['name']} (Copy)"}
-    items_db.append(new_item)
-    next_id += 1
-    save_db()
+    with db_lock:
+        item = next((i for i in items_db if i["id"] == item_id), None)
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+        new_item = {**item, "id": next_id, "name": f"{item['name']} (Copy)"}
+        items_db.append(new_item)
+        next_id += 1
+        _save_db_unlocked()
     log_activity("duplicated", new_item["name"])
     await broadcast({"message": f"Item '{new_item['name']}' duplicated by {user}"})
     return new_item
@@ -333,7 +408,7 @@ def advanced_search(
 ):
     result = items_db
     if q:
-        result = [i for i in result if q.lower() in i["name"].lower() or q.lower() in (i.get("description") or "").lower()]
+        result = [i for i in result if q.lower() in i.get("name", "").lower() or q.lower() in (i.get("description") or "").lower()]
     if min_qty is not None:
         result = [i for i in result if i.get("quantity", 0) >= min_qty]
     if max_qty is not None:
@@ -353,34 +428,40 @@ def get_item(item_id: int):
 @app.post("/api/items")
 async def create_item(item: Item, user: str = Depends(verify_token)):
     global next_id
-    new_item = {"id": next_id, **item.model_dump()}
-    items_db.append(new_item)
+    with db_lock:
+        new_item = {"id": next_id, **item.model_dump()}
+        items_db.append(new_item)
+        next_id += 1
+        _save_db_unlocked()
     log_activity("created", item.name)
-    next_id += 1
-    save_db()
     await broadcast({"message": f"Item '{item.name}' created by {user}"})
     return new_item
 
 @app.put("/api/items/{item_id}")
 async def update_item(item_id: int, item: Item, user: str = Depends(verify_token)):
-    for i, db_item in enumerate(items_db):
-        if db_item["id"] == item_id:
-            items_db[i] = {"id": item_id, **item.model_dump()}
-            save_db()
-            log_activity("updated", item.name)
-            await broadcast({"message": f"Item '{item.name}' updated by {user}"})
-            return items_db[i]
-    raise HTTPException(status_code=404, detail="Item not found")
+    with db_lock:
+        for i, db_item in enumerate(items_db):
+            if db_item["id"] == item_id:
+                items_db[i] = {"id": item_id, **item.model_dump()}
+                updated = items_db[i]
+                _save_db_unlocked()
+                break
+        else:
+            raise HTTPException(status_code=404, detail="Item not found")
+    log_activity("updated", item.name)
+    await broadcast({"message": f"Item '{item.name}' updated by {user}"})
+    return updated
 
 @app.delete("/api/items/{item_id}")
 async def delete_item(item_id: int, user: str = Depends(verify_token)):
     global items_db
-    item = next((i for i in items_db if i["id"] == item_id), None)
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
+    with db_lock:
+        item = next((i for i in items_db if i["id"] == item_id), None)
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+        items_db = [i for i in items_db if i["id"] != item_id]
+        _save_db_unlocked()
     log_activity("deleted", item["name"])
-    items_db = [i for i in items_db if i["id"] != item_id]
-    save_db()
     await broadcast({"message": f"Item '{item['name']}' deleted by {user}"})
     return {"deleted": item_id}
 
@@ -392,27 +473,29 @@ def export_items():
 async def batch_create(items: List[Item], user: str = Depends(verify_token)):
     global next_id
     created = []
+    with db_lock:
+        for item in items:
+            new_item = {"id": next_id, **item.model_dump()}
+            items_db.append(new_item)
+            created.append(new_item)
+            next_id += 1
+        _save_db_unlocked()
     for item in items:
-        new_item = {"id": next_id, **item.model_dump()}
-        items_db.append(new_item)
-        created.append(new_item)
         log_activity("created", item.name)
-        next_id += 1
-    save_db()
     await broadcast({"message": f"{len(created)} items batch created by {user}"})
     return {"created": len(created), "items": created}
 
 @app.get("/api/reports/summary")
 def get_summary_report():
     total_items = len(items_db)
-    total_value = sum(i["price"] * i.get("quantity", 0) for i in items_db)
-    avg_price = sum(i["price"] for i in items_db) / total_items if total_items else 0
+    total_value = sum(i.get("price", 0) * i.get("quantity", 0) for i in items_db)
+    avg_price = sum(i.get("price", 0) for i in items_db) / total_items if total_items else 0
     
     top_categories = defaultdict(lambda: {"count": 0, "value": 0})
     for item in items_db:
         cat = item.get("category", "General")
         top_categories[cat]["count"] += 1
-        top_categories[cat]["value"] += item["price"] * item.get("quantity", 0)
+        top_categories[cat]["value"] += item.get("price", 0) * item.get("quantity", 0)
     
     return {
         "total_items": total_items,
@@ -464,7 +547,9 @@ async def import_items(file: UploadFile = File(...), user: str = Depends(verify_
         raw_tags = item.get("tags", [])
         if not isinstance(raw_tags, list):
             raise HTTPException(status_code=400, detail=f"Item at index {idx} has invalid tags (must be an array)")
-        tags = [str(t) for t in raw_tags if isinstance(t, str)]
+        if any(not isinstance(t, str) for t in raw_tags):
+            raise HTTPException(status_code=400, detail=f"Item at index {idx} has invalid tags (each tag must be a string)")
+        tags = list(raw_tags)
         validated_items.append({
             "id": item.get("id", idx + 1),
             "name": str(item["name"]).strip(),
@@ -480,9 +565,10 @@ async def import_items(file: UploadFile = File(...), user: str = Depends(verify_
     for idx, item in enumerate(validated_items):
         item["id"] = idx + 1
     
-    items_db = validated_items
-    next_id = len(items_db) + 1
-    save_db()
+    with db_lock:
+        items_db = validated_items
+        next_id = len(items_db) + 1
+        _save_db_unlocked()
     log_activity("imported", f"{len(items_db)} items")
     await broadcast({"message": f"{len(items_db)} items imported by {user}"})
     return {"imported": len(items_db)}
